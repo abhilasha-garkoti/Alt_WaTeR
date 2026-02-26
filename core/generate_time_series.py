@@ -9,11 +9,9 @@ def generate_altimetry_timeseries(
     Generate a reservoir water-level time series using:
 
     Median elevation of all valid altimetry points per pass
-    (with representative latitude/longitude closest to the median)
 
     Filtering:
-      - Global MAD filter (threshold = 2.0)
-      - Rolling time-based IQR filter (90D, multiplier = 1.0)
+      - Global MAD filter (threshold = 6.0)
     """
 
     # --------------------------------------------------
@@ -58,80 +56,86 @@ def generate_altimetry_timeseries(
         g = g[~g.is_empty]
         return g.to_crs(4326)
 
-    def mad_filter(df, col, thr=2.0):
-        if df.empty:
-            return df
-        med = df[col].median()
-        mad = np.median(np.abs(df[col] - med))
-        if mad == 0:
-            return df
-        z = 0.6745 * (df[col] - med) / mad
+    def clean_sjoin_columns(gdf):
+        drop_cols = [c for c in ["index_left", "index_right"] if c in gdf.columns]
+        if drop_cols:
+            gdf = gdf.drop(columns=drop_cols)
+        return gdf
+
+    def mad_filter(df, col, thr=6):
+        """
+        Standard 6MAD outlier removal
+
+        Parameters
+        ----------
+        df : DataFrame (date-indexed OK)
+        col : str
+        thr : int (default = 6)
+
+        Returns
+        -------
+        Filtered DataFrame
+        """
+        x = df[col]
+
+        median = x.median()
+        mad = np.median(np.abs(x - median))
+
+        # Avoid divide-by-zero
+        if mad == 0 or np.isnan(mad):
+            return df.copy()
+
+        z = 0.6745 * (x - median) / mad
         return df[np.abs(z) <= thr]
 
-    def rolling_iqr_filter(df, col, window="90D", mult=1.0):
-        if df.empty:
-            return df
-        q1 = df[col].rolling(window, center=True, min_periods=3).quantile(0.25)
-        q3 = df[col].rolling(window, center=True, min_periods=3).quantile(0.75)
-        iqr = q3 - q1
-        return df[(df[col] >= q1 - mult * iqr) & (df[col] <= q3 + mult * iqr)]
-
+    
     # --------------------------------------------------
     # SENTINEL-1 MASK
     # --------------------------------------------------
     def sentinel1_mask(region_ee, target_date):
+        start = ee.Date(target_date - timedelta(days=s1_search_days))
+        end   = ee.Date(target_date + timedelta(days=s1_search_days))
+
         coll = (
             ee.ImageCollection("COPERNICUS/S1_GRD")
             .filterBounds(region_ee)
             .filter(ee.Filter.eq("instrumentMode", "IW"))
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+            .filterDate(start, end)
             .select("VV")
         )
 
-        coll = coll.filterDate(
-            ee.Date(target_date - timedelta(days=s1_search_days)),
-            ee.Date(target_date + timedelta(days=s1_search_days)),
-        )
-
         if coll.size().getInfo() == 0:
-            return None
+            return None, None
 
-        imgs = coll.toList(coll.size()).getInfo()
-        times = np.array([i["properties"]["system:time_start"] for i in imgs])
-        idx = np.argmin(np.abs(times - target_date.timestamp() * 1000))
-        nearest = datetime.fromtimestamp(times[idx] / 1000, tz=UTC)
+        target = ee.Date(target_date)
 
-        img = (
-            coll.filterDate(
-                nearest.strftime("%Y-%m-%d"),
-                (nearest + timedelta(days=1)).strftime("%Y-%m-%d"),
-            )
-            .mosaic()
-            .focal_median(1)
-        )
+        def add_time_diff(img):
+            diff = img.date().difference(target, "day").abs()
+            return img.set("time_diff", diff)
 
-        try:
-            sample = img.sample(region=region_ee, scale=30, numPixels=500)
-            arr = np.array(sample.aggregate_array("VV").getInfo())
-            arr = arr[np.isfinite(arr)]
-            if arr.size == 0:
-                return None
-            return img.lt(threshold_otsu(arr))
-        except Exception:
-            return None
+        closest_img = ee.Image(coll.map(add_time_diff).sort("time_diff").first())
+        closest_date = ee.Date(closest_img.get("system:time_start"))
 
-    # --------------------------------------------------
-    # INIT EE
-    # --------------------------------------------------
-    try:
-        ee.Initialize()
-    except Exception:
-        ee.Authenticate()
-        ee.Initialize()
+        same_day = coll.filterDate(closest_date, closest_date.advance(1, "day"))
+        mosaic = same_day.mosaic().clip(region_ee)
+        vv = mosaic.select("VV")
 
-    # --------------------------------------------------
-    # BUFFER MAX EXTENT
-    # --------------------------------------------------
+        # Otsu threshold
+        sample = vv.sample(region=region_ee, scale=30, numPixels=5000, geometries=False)
+        arr = np.array(sample.aggregate_array("VV").getInfo())
+        arr = arr[np.isfinite(arr)]
+
+        if arr.size < 100:
+            return None, None
+
+        thr = threshold_otsu(arr)
+        water_mask = vv.lt(thr).rename("water")
+
+        s1_date = closest_date.format("YYYY-MM-dd").getInfo()
+        return water_mask, s1_date
+
+
     buffered_max = buffer_gdf(max_gdf, buffer_m)
     max_union = buffered_max.geometry.union_all()
     region_ee = geemap.geopandas_to_ee(buffered_max)
@@ -155,7 +159,7 @@ def generate_altimetry_timeseries(
             continue
 
         # Fill missing corrections
-        for c in ["iono", "dry", "wet", "pole", "solid"]:
+        for c in ["iono", "dry", "wet", "pole", "solid","load"]:
             if c not in df.columns:
                 df[c] = 0.0
             df[c] = df[c].fillna(0.0)
@@ -164,13 +168,11 @@ def generate_altimetry_timeseries(
             df["geoid"] = 0.0
         df["geoid"] = df["geoid"].fillna(0.0)
 
-        # Correct elevation
-        df["elevation"] = (
-            df["altitude"]
-            - (df["range"] + df["dry"] + df["wet"]
-               + df["pole"] + df["solid"] + df["iono"])
-            - df["geoid"]
-        )
+        corr= df["dry"] + df["wet"] + df["pole"] + df["solid"] + df["iono"]+df["load"]
+
+        #elevation
+        df["elevation"] = df["altitude"]- (df["range"] + corr) - df["geoid"]
+        
 
         df = df.dropna(subset=["elevation", "latitude", "longitude", "date","cycle"])
 
@@ -186,31 +188,83 @@ def generate_altimetry_timeseries(
 
         # Sentinel-1 water mask (Class 3–4 only)
         if use_s1:
-            mask = sentinel1_mask(region_ee, pd.to_datetime(gdf["date"].iloc[0]))
+
+            # Get Sentinel-1 mask
+            mask, s1_date = sentinel1_mask(
+                region_ee,
+                pd.to_datetime(gdf["date"].iloc[0])
+            )
+
+            # No SAR data → skip this file
             if mask is None:
                 continue
 
-            fc = mask.sampleRegions(
-                geemap.geopandas_to_ee(gdf),
-                scale=30,
-                geometries=True,
-            )
+            # Convert points to EE
+            fc = geemap.geopandas_to_ee(gdf)
 
-            if fc.size().getInfo() == 0:
+            # ---- SAFE water fraction extractor ----
+            def add_water_fraction(feat):
+                geom = feat.geometry()
+
+                # Compute mean water fraction inside 100 m buffer
+                result = mask.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=geom.buffer(100),  # YOUR BUFFER
+                    scale=10,
+                    bestEffort=True,
+                    maxPixels=1e6
+                )
+
+                # Force property existence even if NULL
+                frac = ee.Algorithms.If(
+                    result.contains("water"),
+                    result.get("water"),
+                    -1  # marker for missing
+                )
+
+                return feat.set("water_frac", frac)
+
+            # Map over features
+            fc = fc.map(add_water_fraction)
+
+            # Convert back to GeoDataFrame
+            gdf = geemap.ee_to_gdf(fc)
+
+            # --------------------------------------------------
+            # SAFETY CHECKS (prevents KeyError)
+            # --------------------------------------------------
+
+            # If column completely missing → skip safely
+            if "water_frac" not in gdf.columns:
                 continue
 
-            gdf = geemap.ee_to_gdf(fc)
-            band = next(
-                c for c in gdf.columns
-                if c not in ("geometry", "id", "system:index")
-            )
-            gdf = gdf[gdf[band].astype(bool)]
+            # Convert to numeric safely
+            gdf["water_frac"] = pd.to_numeric(gdf["water_frac"], errors="coerce")
 
+            # Remove EE missing marker (-1)
+            gdf.loc[gdf["water_frac"] < 0, "water_frac"] = np.nan
+
+            # Drop rows where SAR had no info
+            gdf = gdf.dropna(subset=["water_frac"])
             if gdf.empty:
                 continue
 
-        date = pd.to_datetime(gdf["date"].iloc[0])
+            # --------------------------------------------------
+                    # Water classification
+            # --------------------------------------------------
+            gdf["water_flag"] = (gdf["water_frac"] >= 0.4).astype(int)
+            gdf["s1_date"] = s1_date
+
+            # Keep only water points
+            gdf = gdf[gdf["water_flag"] == 1]
+            if gdf.empty:
+                continue
+
+
+        gdf = clean_sjoin_columns(gdf)
+
         mission = gdf["mission"].iloc[0]
+        date = pd.to_datetime(gdf["date"].iloc[0])
 
         # ---------------- Median time series ----------------
         med = gdf["elevation"].median()
@@ -252,8 +306,7 @@ def generate_altimetry_timeseries(
         )
 
         ts = mad_filter(ts, "elevation")
-        ts = rolling_iqr_filter(ts, "elevation")
-
+        
         ts.reset_index().to_csv(
             MEDIAN_CSV, index=False, float_format="%.3f"
         )

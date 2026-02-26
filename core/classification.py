@@ -113,28 +113,13 @@ def compute_terrain_indices_from_buffer(buffer_geom):
     dem_clip = dem.rio.clip(geom.geometry, geom.crs)
     z = dem_clip.values.astype(float)
 
-    lat_mean = float(dem_clip.lat.mean())
-    dx = 111320 * np.cos(np.deg2rad(lat_mean))
-    dy = 111320
-
-    slope = horn_slope_deg(z, dx, dy)
     tri = riley_tri(z)
-
-    geoid = (
-        pygmt.datasets.load_earth_geoid("01m", region=region)
-        .rio.write_crs("EPSG:4326")
-        .load()
-    )
-
-    geoid_clip = geoid.rio.clip(geom.geometry, geom.crs)
-    N = geoid_clip.values.astype(float)
 
     return {
         "elev_p95_p05_m": float(np.nanpercentile(z, 95) - np.nanpercentile(z, 5)),
-        "slope_p95_deg": float(np.nanpercentile(slope, 95)),
         "tri_p95_m": float(np.nanpercentile(tri, 95)),
-        "geoid_p95_p05_m": float(np.nanpercentile(N, 95) - np.nanpercentile(N, 5)),
     }
+
 
 # ==========================================================
 # TERRAIN COMPLEXITY (AT LEAST 2 FAILURES)  ← ONLY CHANGE
@@ -172,12 +157,11 @@ def is_complex_terrain(base_folder, max_water_input):
 
     failures = sum([
         metrics["elev_p95_p05_m"] >= 500,
-        metrics["slope_p95_deg"] >= 10,
         metrics["tri_p95_m"] >= 100,
-        metrics["geoid_p95_p05_m"] >= 1.5,
+    
     ])
 
-    complex_flag = failures >= 2
+    complex_flag = failures >= 1
 
     return complex_flag, pd.DataFrame([metrics])
 
