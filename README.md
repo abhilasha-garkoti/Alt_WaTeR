@@ -1,12 +1,12 @@
-# Alt-WaTeR
+# Alt-WaTER
 
-**Water level Time series for Reservoirs using satellite Altimetry**
+**Water level Time series Estimation for Reservoirs using satellite Altimetry**
 
 ---
 
 ## Description
 
-Alt-WaTeR is a *Python* software for generating reservoir water level time series from satellite radar altimetry data. The software combines multi-mission satellite altimetry, Global Surface Water (GSW) water masks, and Sentinel-1 images accessed through Google Earth Engine. User interaction is provided through a graphical user interface.
+Alt-WaTER is a *Python* software for generating reservoir water level time series from satellite radar altimetry data. The software combines multi-mission satellite altimetry, Global Surface Water (GSW) water masks, and Sentinel-1 images accessed through Google Earth Engine. User interaction is provided through a graphical user interface.
 
 ---
 
