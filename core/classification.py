@@ -17,7 +17,6 @@ def is_high_resolution(filename: str) -> bool:
     f = filename.upper()
     return (
         "ENHANCED_MEASUREMENT" in f or
-        "SWOT" in f or
         ("S6" in f and "__HR_" in f)
     )
 
