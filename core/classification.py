@@ -170,7 +170,7 @@ def is_complex_terrain(base_folder, max_water_input):
 def check_altimetry_tracks(base_folder, max_water_input, perm_water_input):
     max_water = load_vector(max_water_input)
     perm_water = load_vector(perm_water_input)
-    max_inner = inward_buffer_km(max_water, 1)
+    max_inner = inward_buffer_km(max_water, 2)
 
     records = []
 

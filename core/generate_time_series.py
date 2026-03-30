@@ -45,7 +45,7 @@ def generate_altimetry_timeseries(
     use_s1 = base_class in [3, 4]
 
     # −1 km inward buffer ONLY for Class 1–2
-    buffer_m = -1000 if base_class in [1, 2] else 0
+    buffer_m = -2000 if base_class in [1, 2] else 0
 
     # --------------------------------------------------
     # HELPERS
